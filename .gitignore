@@ -1,0 +1,15 @@
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+*.pt
+*.pkl
+*.joblib
+*.parquet
+.env
+node_modules/
+__pycache__/
+.venv/
+dist/
+build/
+ml/artifacts/
