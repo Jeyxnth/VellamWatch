@@ -27,6 +27,13 @@ from ml.features import (FEATURE_COLUMNS, MONOTONE, build_static_table, data_sou
                          percentile_rank, spatial_block_folds)
 
 
+def _display_path(d) -> str:
+    try:
+        return Path(d).resolve().relative_to(config.REPO_ROOT).as_posix()
+    except ValueError:
+        return str(Path(d).resolve())
+
+
 def monotone_string() -> str:
     return "(" + ",".join(str(MONOTONE.get(c, 0)) for c in FEATURE_COLUMNS) + ")"
 
@@ -130,7 +137,8 @@ def fit_rain_params(table, hotspots, data_dir, u_oof) -> dict:
     else:
         res["note"] += (f"fit rejected (k={k_hat:.4f}, r0={r0_hat:.1f} outside bounds {config.RAIN_K_BOUNDS} / "
                         f"{config.RAIN_R0_BOUNDS}); heuristic defaults kept for both. ")
-    res["note"] += f"event mean rain_index mm={{n: round(m, 1) for n, m in zip(names, means)}}; event dates from {win_src}."
+    idx_mm = {n: round(m, 1) for n, m in zip(names, means)}
+    res["note"] += f"event mean rain_index mm={idx_mm}; event dates from {win_src}."
     return res
 
 
@@ -161,7 +169,7 @@ def train(data_dir=None, artifact_dir=None, verbose=False) -> dict:
     meta = {
         "data_source": src,
         "banner": config.SYNTHETIC_BANNER if src == "synthetic" else None,
-        "data_dir": str(d.resolve()),
+        "data_dir": _display_path(d),
         "n_cells": int(len(table)),
         "n_hotspot_cells": n_pos,
         "hotspot_cells_per_event": per_event,
