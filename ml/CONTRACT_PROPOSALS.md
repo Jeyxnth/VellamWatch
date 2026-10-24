@@ -19,3 +19,6 @@ Plus `cells.geojson` carries `cell_id`, `row`, `col`; row 0 southernmost, col 0 
 
 ## Open (not yet proposed in the contract)
 - If the band-share report in `BACKTEST.md` shows too many "high" cells at 100 mm, it prints a PROPOSAL (a new `RAIN_R0` or `BAND_HIGH`). Changing `BAND_HIGH` would be a contract change; nothing is applied automatically.
+
+## Note on stage 2 (no contract change needed)
+Stage 2 is now "budgeted ranking" (policy targets, not fitted): rain severity sets the share of study-area cells that are high/medium, susceptibility picks which. `risk_score` stays a 0-1 ranking score and the 0.33 / 0.66 thresholds are unchanged. Because percentiles use the full study grid, a street has the same score and band in any bbox. If the lead wants the UI/slides to quote the policy ("about 15% of the area is flagged high at 100 mm in 24 h"), that wording belongs in the docs, not in the API.
