@@ -1,0 +1,9 @@
+# ML core: never commit models, synthetic data, venv or caches
+synthetic_out/
+.venv/
+.pytest_cache/
+__pycache__/
+artifacts/*
+!artifacts/plots/
+artifacts/plots/*
+!artifacts/plots/real_*.png

@@ -1,0 +1,10 @@
+pandas>=2.0
+numpy>=1.24
+pyarrow>=14
+xgboost>=2.0
+scikit-learn>=1.3
+scipy>=1.10      # installed with scikit-learn; used for the rain-parameter fit
+matplotlib>=3.7
+pytest>=7.4
+# optional: python -m ml.scripts.preview_map
+# folium>=0.15
