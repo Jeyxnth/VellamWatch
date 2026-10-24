@@ -12,4 +12,6 @@ __pycache__/
 .venv/
 dist/
 build/
-ml/artifacts/
+ml/artifacts/*
+!ml/artifacts/model/
+!ml/artifacts/plots/
