@@ -1,9 +1,16 @@
-# ML core: never commit models, synthetic data, venv or caches
+# ML core: only the real model files and real plots are committable. Everything else is ignored.
 synthetic_out/
 .venv/
 .pytest_cache/
 __pycache__/
+preview.html
+
 artifacts/*
+!artifacts/model/
+artifacts/model/*
+!artifacts/model/model.json
+!artifacts/model/meta.json
 !artifacts/plots/
 artifacts/plots/*
 !artifacts/plots/real_*.png
+# artifacts/model_synthetic/ and artifacts/plots/synthetic_* stay ignored
