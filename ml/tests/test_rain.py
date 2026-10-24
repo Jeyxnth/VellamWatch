@@ -59,7 +59,7 @@ def test_resolve_as_of_default_is_now_ist(monkeypatch):
     monkeypatch.delenv("ML_AS_OF", raising=False)
     ts = rain.resolve_as_of()
     assert ts.utcoffset().total_seconds() == 5.5 * 3600
-    assert abs((ts - rain.resolve_as_of("2030-01-01T00:00:00")).days) > 1  # naive input is read as IST
+    assert rain.resolve_as_of("2030-01-01T00:00:00Z").utcoffset().total_seconds() == 5.5 * 3600
 
 
 def test_idw_weights_sum_to_one_and_prefer_near_points():

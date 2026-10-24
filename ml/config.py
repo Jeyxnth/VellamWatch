@@ -24,6 +24,12 @@ def artifact_root() -> Path:
     return Path(os.environ.get("ML_ARTIFACT_DIR") or ARTIFACT_ROOT)
 
 
+def model_dir(source: str) -> Path:
+    """model.json + meta.json for a data source. Real: artifacts/model/ (committable);
+    synthetic: artifacts/model_synthetic/ (always git-ignored)."""
+    return artifact_root() / ("model" if source == "real" else "model_synthetic")
+
+
 # ---- risk bands (contract section A; only the ML lead tunes these) ---------
 BAND_MEDIUM = 0.33
 BAND_HIGH = 0.66
@@ -93,11 +99,21 @@ RAIN_BANDS_24H = [
 
 # ---- event dates -----------------------------------------------------------
 # TODO(verify with data owner): used only if data/processed/events.csv is absent.
-# (start, end) are inclusive calendar dates in IST. See CONTRACT_PROPOSALS.md.
+# Same format as events.csv (contract section D): ISO 8601 with +05:30, start inclusive, end exclusive.
 EVENTS_TODO = {
-    "2015": ("2015-12-01", "2015-12-03"),
-    "2023": ("2023-12-02", "2023-12-05"),  # Cyclone Michaung
+    "2015": ("2015-12-01T00:00:00+05:30", "2015-12-04T00:00:00+05:30"),
+    "2023": ("2023-12-02T00:00:00+05:30", "2023-12-06T00:00:00+05:30"),  # Cyclone Michaung
 }
+
+# ---- band-share check (BACKTEST.md section C) ---------------------------------
+BAND_CHECK_TOTALS_MM = (0, 25, 50, 100, 150, 200)      # 24 h rainfall scenarios
+BAND_CHECK_PROFILES = {                                  # share of the 24 h total falling in the wettest 3 h
+    "uniform over 24 h": 3 / 24,
+    "burst: half of it in 3 h": 0.5,
+}
+BAND_CHECK_AT_MM = 100
+BAND_CHECK_MAX_HIGH_SHARE = 0.35   # above this at 100 mm, BACKTEST.md PROPOSES (never applies) changes
+BAND_CHECK_TARGET_HIGH_SHARE = 0.20
 
 # ---- explanations ----------------------------------------------------------
 MIN_DRIVER_CONTRIB = 0.15  # min XGBoost contribution (log-odds) for a static driver

@@ -1,4 +1,4 @@
-"""Write SYNTHETIC data in the exact contract section D formats (pipeline tests only).
+"""Write SYNTHETIC data in the exact contract (v1.1) section D formats, including events.csv (pipeline tests only).
 
 *** SYNTHETIC DATA - PIPELINE TEST ONLY - NOT RESULTS ***
 
@@ -108,7 +108,7 @@ def generate(out_dir, seed=config.SEED, bbox=SUB_BBOX, now=None) -> dict:
             cid = f"r{r}_c{c}"
             ring = [[lon0, lat0], [lon0 + dlon, lat0], [lon0 + dlon, lat0 + dlat],
                     [lon0, lat0 + dlat], [lon0, lat0]]
-            feats_cells.append({"type": "Feature", "properties": {"cell_id": cid},
+            feats_cells.append({"type": "Feature", "properties": {"cell_id": cid, "row": r, "col": c},
                                 "geometry": {"type": "Polygon", "coordinates": [ring]}})
             rec = {"cell_id": cid, "lat": lat0 + dlat / 2, "lon": lon0 + dlon / 2}
             rec.update({k: float(v[r, c]) for k, v in t.items()})
@@ -133,6 +133,8 @@ def generate(out_dir, seed=config.SEED, bbox=SUB_BBOX, now=None) -> dict:
     # rainfall: 3x3 points; burst during each event window + a forecast block starting now
     pts = [(min_lat + (max_lat - min_lat) * i / 2, min_lon + (max_lon - min_lon) * j / 2, 0.85 + 0.15 * j)
            for i in range(3) for j in range(3)]
+    ev_rows = [{"event": e, "start": a, "end": b} for e, (a, b) in config.EVENTS_TODO.items()]
+    pd.DataFrame(ev_rows).to_csv(out / "events.csv", index=False)  # SYNTHETIC dates = the config placeholders
     windows, _ = event_windows(out)
     blocks = []
     for event, (start, end) in windows.items():

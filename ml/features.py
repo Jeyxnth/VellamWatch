@@ -27,7 +27,11 @@ MONOTONE = {"elevation_m": -1, "elev_pct": -1, "local_relief_m": -1, "sink_depth
 
 
 class MissingDataError(FileNotFoundError):
-    """A required contract data file is missing or malformed."""
+    """A required contract data file is missing or has missing columns."""
+
+
+class DataFormatError(ValueError):
+    """A contract data file exists but violates the contract; the message names the file to fix."""
 
 
 # ---- locating data ----------------------------------------------------------
@@ -87,23 +91,63 @@ def _polygon_centroid(ring: np.ndarray):
 
 
 def load_cells(data_dir) -> pd.DataFrame:
-    """cells.geojson -> DataFrame[cell_id, lat, lon, row, col] (centroids computed here)."""
+    """cells.geojson -> DataFrame[cell_id, lat, lon, row, col] (centroids computed here).
+
+    Validates contract section A: properties cell_id, row, col on every feature; row/col agree
+    with cell_id; contiguous indices from 0; row 0 southernmost, col 0 westernmost.
+    """
     path = _require(data_dir, "cells.geojson")
     with open(path, encoding="utf-8") as f:
         gj = json.load(f)
     recs = []
+    bad_props = []
     for feat in gj.get("features", []):
-        cid = feat["properties"]["cell_id"]
+        props = feat.get("properties") or {}
+        missing = [k for k in ("cell_id", "row", "col") if k not in props]
+        if missing:
+            bad_props.append((props.get("cell_id", "?"), missing))
+            continue
         geom = feat["geometry"]
         poly = geom["coordinates"][0] if geom["type"] == "Polygon" else geom["coordinates"][0][0]
         lon, lat = _polygon_centroid(np.asarray(poly, dtype=float)[:, :2])
-        row, col = parse_cell_id(cid)
-        recs.append((cid, lat, lon, row, col))
+        recs.append((props["cell_id"], lat, lon, props["row"], props["col"]))
+    if bad_props:
+        raise DataFormatError(
+            f"cells.geojson ({path}): {len(bad_props)} features lack required properties, e.g. cell "
+            f"'{bad_props[0][0]}' is missing {bad_props[0][1]}. Contract section A: every feature needs "
+            "properties cell_id, row and col. Fix cells.geojson.")
     df = pd.DataFrame(recs, columns=["cell_id", "lat", "lon", "row", "col"])
     if df.empty:
-        raise MissingDataError(f"{path} contains no features")
+        raise MissingDataError(f"cells.geojson ({path}) contains no features")
     if df.cell_id.duplicated().any():
-        raise ValueError(f"{path} has duplicate cell_ids")
+        raise DataFormatError(f"cells.geojson ({path}) has duplicate cell_ids. Fix cells.geojson.")
+    for c in ("row", "col"):
+        if not (pd.api.types.is_integer_dtype(df[c]) or (df[c] == df[c].round()).all()):
+            raise DataFormatError(f"cells.geojson ({path}): property '{c}' must be an integer. Fix cells.geojson.")
+        df[c] = df[c].astype(int)
+    parsed = df.cell_id.map(parse_cell_id)
+    mismatch = df[(parsed.str[0] != df.row) | (parsed.str[1] != df.col)]
+    if len(mismatch):
+        r = mismatch.iloc[0]
+        raise DataFormatError(
+            f"cells.geojson ({path}): {len(mismatch)} cells where properties row/col disagree with cell_id, "
+            f"e.g. cell_id '{r.cell_id}' has row={r.row}, col={r.col}. Fix cells.geojson.")
+    for c in ("row", "col"):
+        n_unique = df[c].nunique()
+        if df[c].min() != 0 or df[c].max() != n_unique - 1:
+            raise DataFormatError(
+                f"cells.geojson ({path}): {c} indices are not contiguous from 0 (min {df[c].min()}, max "
+                f"{df[c].max()}, {n_unique} distinct values). Contract section A requires one grid with "
+                "contiguous non-negative integers. Fix cells.geojson.")
+    # orientation: row 0 southernmost, col 0 westernmost
+    lat_by_row = df.groupby("row").lat.mean()
+    lon_by_col = df.groupby("col").lon.mean()
+    if len(lat_by_row) > 1 and lat_by_row.iloc[0] >= lat_by_row.iloc[-1]:
+        raise DataFormatError(f"cells.geojson ({path}): row 0 must be the SOUTHERNMOST row (latitude should "
+                              "increase with row). Fix cells.geojson (contract section A).")
+    if len(lon_by_col) > 1 and lon_by_col.iloc[0] >= lon_by_col.iloc[-1]:
+        raise DataFormatError(f"cells.geojson ({path}): col 0 must be the WESTERNMOST column (longitude should "
+                              "increase with col). Fix cells.geojson (contract section A).")
     return df
 
 
@@ -129,26 +173,39 @@ def load_hotspots(data_dir) -> pd.DataFrame:
     return df
 
 
+def _event_ts(value, what, source) -> pd.Timestamp:
+    ts = pd.Timestamp(str(value).strip())
+    if ts.tzinfo is None:
+        raise DataFormatError(
+            f"{source}: {what} '{value}' has no UTC offset. Contract section D requires ISO 8601 with +05:30, "
+            "e.g. 2023-12-02T00:00:00+05:30. Fix " + source + ".")
+    return ts.tz_convert(config.IST)
+
+
 def event_windows(data_dir):
     """event -> (start, end_exclusive) tz-aware IST, plus a provenance string.
 
-    Uses data/processed/events.csv (event,start,end) if present, else config.EVENTS_TODO.
-    Date-only `end` is inclusive (one day is added).
+    Reads data/processed/events.csv (event,start,end; ISO with +05:30; start inclusive, end exclusive),
+    else config.EVENTS_TODO (same format, UNVERIFIED).
     """
-    def to_window(start, end):
-        s = pd.Timestamp(start)
-        e = pd.Timestamp(end)
-        s = s.tz_localize(config.IST) if s.tzinfo is None else s.tz_convert(config.IST)
-        e_exact = len(str(end).strip()) > 10
-        e = e.tz_localize(config.IST) if e.tzinfo is None else e.tz_convert(config.IST)
-        return s, (e if e_exact else e + pd.Timedelta(days=1))
-
     path = Path(data_dir) / "events.csv"
     if path.exists():
         ev = pd.read_csv(path, dtype=str)
-        return {r.event.strip(): to_window(r.start, r.end) for r in ev.itertuples()}, "events.csv (data owner)"
-    return ({k: to_window(*v) for k, v in config.EVENTS_TODO.items()},
-            "config.EVENTS_TODO (UNVERIFIED dates; see CONTRACT_PROPOSALS.md)")
+        missing = [c for c in ("event", "start", "end") if c not in ev.columns]
+        if missing:
+            raise MissingDataError(f"events.csv ({path}) is missing columns {missing} (contract section D)")
+        raw, source = {r.event.strip(): (r.start, r.end) for r in ev.itertuples()}, "events.csv"
+        prov = "events.csv (SYNTHETIC placeholder dates)" if is_synthetic(data_dir) else "events.csv (data owner)"
+    else:
+        raw, source = dict(config.EVENTS_TODO), "config.EVENTS_TODO"
+        prov = "config.EVENTS_TODO (UNVERIFIED dates; events.csv missing, see contract section D)"
+    out = {}
+    for event, (start, end) in raw.items():
+        s, e = _event_ts(start, f"start of event '{event}'", source), _event_ts(end, f"end of event '{event}'", source)
+        if e <= s:
+            raise DataFormatError(f"{source}: event '{event}' ends ({end}) before it starts ({start}). Fix {source}.")
+        out[event] = (s, e)
+    return out, prov
 
 
 # ---- static feature table ----------------------------------------------------

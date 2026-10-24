@@ -11,10 +11,10 @@ import argparse
 import json
 import sys
 import warnings
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import xgboost as xgb
 from scipy.optimize import minimize
 from sklearn.linear_model import LogisticRegression
@@ -83,14 +83,21 @@ def fit_rain_params(table, hotspots, data_dir, u_oof) -> dict:
     Needs events with dates, hotspots and rainfall coverage, and at least
     RAIN_FIT_MIN_SPREAD_MM between event rain indexes. Otherwise defaults are kept.
     """
-    res = {"k": config.RAIN_K, "r0": config.RAIN_R0,
+    res = {"k": config.RAIN_K, "r0": config.RAIN_R0, "fitted": False,
            "k_source": "heuristic, not fitted", "r0_source": "heuristic, not fitted", "note": ""}
     windows, win_src = event_windows(data_dir)
+    if "UNVERIFIED" in win_src:
+        warnings.warn(f"events.csv not found in {data_dir}; using {win_src}")
+    unknown = sorted(set(hotspots.event) - set(windows))
+    if unknown:
+        warnings.warn(f"hotspots.csv events {unknown} have no entry in events.csv; they are ignored for rain fitting")
     try:
         rain_df = rainmod.load_rainfall(data_dir)
     except FileNotFoundError as e:
         res["note"] = f"rain params not fitted: {e}"
         return res
+    for msg in rainmod.coverage_warnings(rain_df, windows):
+        warnings.warn(msg)
     samples = []  # (event, y, rain_index per cell)
     skipped = []
     for event, (start, end) in windows.items():
@@ -133,7 +140,7 @@ def fit_rain_params(table, hotspots, data_dir, u_oof) -> dict:
     k_ok = config.RAIN_K_BOUNDS[0] < k_hat < config.RAIN_K_BOUNDS[1]
     r0_ok = config.RAIN_R0_BOUNDS[0] < r0_hat < config.RAIN_R0_BOUNDS[1]
     if k_ok and r0_ok:  # k and r0 are only meaningful together; accept both or neither
-        res.update(k=k_hat, r0=r0_hat, k_source=f"fitted on events {names}", r0_source=f"fitted on events {names}")
+        res.update(k=k_hat, r0=r0_hat, fitted=True, k_source=f"fitted on events {names}", r0_source=f"fitted on events {names}")
     else:
         res["note"] += (f"fit rejected (k={k_hat:.4f}, r0={r0_hat:.1f} outside bounds {config.RAIN_K_BOUNDS} / "
                         f"{config.RAIN_R0_BOUNDS}); heuristic defaults kept for both. ")
@@ -146,7 +153,7 @@ def train(data_dir=None, artifact_dir=None, verbose=False) -> dict:
     """Train, save artifacts under <artifact_root>/<real|synthetic>/ and return the meta dict."""
     d = find_data_dir(data_dir)
     src = data_source(d)
-    out = Path(artifact_dir) if artifact_dir else config.artifact_root() / src
+    out = Path(artifact_dir) if artifact_dir else config.model_dir(src)
     table = build_static_table(d)
     hotspots = load_hotspots(d)
     y_true, y_train, w = make_labels(table, hotspots, None, config.NEIGHBOUR_WEIGHT)
@@ -183,7 +190,7 @@ def train(data_dir=None, artifact_dir=None, verbose=False) -> dict:
         "seed": config.SEED,
         "xgb_params": config.XGB_PARAMS,
         "neighbour_weight": config.NEIGHBOUR_WEIGHT,
-        "trained_at": datetime.now().isoformat(timespec="seconds"),
+        "trained_at": pd.Timestamp.now(tz=config.IST).isoformat(timespec="seconds"),
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return meta
@@ -204,7 +211,7 @@ def main(argv=None):
     print(f"rain k={r['k']:.4f} ({r['k_source']}), r0={r['r0']:.1f} ({r['r0_source']})")
     if r["note"]:
         print(f"note        : {r['note']}")
-    print(f"artifacts   : {config.artifact_root() / meta['data_source']}")
+    print(f"artifacts   : {config.model_dir(meta['data_source'])}")
     return 0
 
 

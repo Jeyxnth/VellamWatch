@@ -1,8 +1,9 @@
 """Rainfall handling: as_of window selection, IDW to cells, rain index, risk combination.
 
 Forecast window = [floor_hour(as_of), floor_hour(as_of) + horizon_h). Hourly rows in
-rainfall.parquet are read as "precip_mm accumulated in the hour starting at timestamp".
-as_of = argument > env ML_AS_OF > current time in IST.
+rainfall.parquet are read as "precip_mm accumulated in the hour starting at timestamp"
+(contract section D). as_of = argument > env ML_AS_OF > current time in IST; an explicit
+as_of must be ISO 8601 WITH a UTC offset (contract section B).
 """
 import os
 import warnings
@@ -13,19 +14,35 @@ import numpy as np
 import pandas as pd
 
 from ml import config
-from ml.features import _require
+from ml.features import DataFormatError, _require
 
 
 class NoRainfallError(ValueError):
     """rainfall.parquet has no data for the requested window."""
 
 
+def parse_as_of(value, source="as_of") -> pd.Timestamp:
+    """ISO 8601 string (or tz-aware datetime) with a UTC offset -> Timestamp in IST."""
+    hint = "ISO 8601 with a UTC offset, e.g. 2023-12-03T00:00:00+05:30"
+    try:
+        ts = pd.Timestamp(value)
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"{source} '{value}' is not a valid timestamp; use {hint}") from e
+    if pd.isna(ts):
+        raise ValueError(f"{source} '{value}' is not a valid timestamp; use {hint}")
+    if ts.tzinfo is None:
+        raise ValueError(f"{source} '{value}' has no UTC offset; use {hint}")
+    return ts.tz_convert(config.IST)
+
+
 def resolve_as_of(as_of=None) -> pd.Timestamp:
-    value = as_of if as_of is not None else os.environ.get("ML_AS_OF")
-    if not value:
-        return pd.Timestamp.now(tz=config.IST)
-    ts = pd.Timestamp(value)
-    return ts.tz_localize(config.IST) if ts.tzinfo is None else ts.tz_convert(config.IST)
+    """as_of argument > env ML_AS_OF > now (IST). Values without a UTC offset are rejected."""
+    if as_of is not None:
+        return parse_as_of(as_of, "as_of")
+    env = os.environ.get("ML_AS_OF")
+    if env:
+        return parse_as_of(env, "env ML_AS_OF")
+    return pd.Timestamp.now(tz=config.IST)
 
 
 _RAIN_CACHE = {}
@@ -42,7 +59,20 @@ def load_rainfall(data_dir) -> pd.DataFrame:
     if missing:
         raise ValueError(f"{path} is missing columns {missing} (contract section D)")
     ts = pd.to_datetime(df["timestamp"])
-    ts = ts.dt.tz_localize(config.IST) if ts.dt.tz is None else ts.dt.tz_convert(config.IST)
+    if ts.dt.tz is None:
+        raise DataFormatError(
+            f"rainfall.parquet ({path}): timestamps have no UTC offset. Contract section D requires hour-start "
+            "timestamps in +05:30. Fix rainfall.parquet.")
+    ts = ts.dt.tz_convert(config.IST)  # hour starts are checked in +05:30, the contract timezone
+    off_hour = ~((ts.dt.minute == 0) & (ts.dt.second == 0) & (ts.dt.microsecond == 0) & (ts.dt.nanosecond == 0))
+    if off_hour.any():
+        raise DataFormatError(
+            f"rainfall.parquet ({path}): {int(off_hour.sum())} timestamps are not on the hour in +05:30, e.g. "
+            f"{ts[off_hour].iloc[0].isoformat()}. Contract section D requires the START of each hour in +05:30. "
+            "Fix rainfall.parquet.")
+    if df.duplicated(["timestamp", "lat", "lon"]).any():
+        warnings.warn("rainfall.parquet has duplicate (timestamp, lat, lon) rows; they are averaged. "
+                      "Contract section D wants one row per (timestamp, lat, lon).")
     out = pd.DataFrame({
         "timestamp": ts,
         "lat": df["lat"].astype(float),
@@ -53,6 +83,28 @@ def load_rainfall(data_dir) -> pd.DataFrame:
     _WINDOW_CACHE.clear()  # windows are keyed by id(df); never reuse them across files
     _RAIN_CACHE[key] = out
     return out
+
+
+def coverage_warnings(rain_df: pd.DataFrame, windows: dict, check_forecast: bool = False) -> list:
+    """Human-readable problems with rainfall coverage (warn, never crash).
+
+    windows: event -> (start, end_exclusive). check_forecast adds the 72 h-from-now requirement.
+    """
+    msgs = []
+    present = set(rain_df.timestamp)
+    for event, (start, end) in windows.items():
+        want = pd.date_range(start.floor("h"), end, freq="h", inclusive="left")
+        have = sum(1 for t in want if t in present)
+        if have < len(want):
+            msgs.append(f"rainfall.parquet covers only {have} of {len(want)} hours of event '{event}' "
+                        f"({start.isoformat()} to {end.isoformat()}). Contract section D: it must cover every "
+                        "event window. Ask the data owner to extend rainfall.parquet.")
+    if check_forecast:
+        need = pd.Timestamp.now(tz=config.IST).floor("h") + pd.Timedelta(hours=72)
+        if rain_df.timestamp.max() < need:
+            msgs.append(f"rainfall.parquet ends at {rain_df.timestamp.max().isoformat()}, less than 72 h of "
+                        "forecast from now. Contract section D requires at least 72 h; refresh the forecast.")
+    return msgs
 
 
 @dataclass
