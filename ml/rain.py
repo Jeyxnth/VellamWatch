@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ml import config
+from ml import budget, config
 from ml.features import DataFormatError, _require
 
 
@@ -80,7 +80,8 @@ def load_rainfall(data_dir) -> pd.DataFrame:
         "precip_mm": df["precip_mm"].astype(float).fillna(0.0).clip(lower=0.0),
     }).sort_values("timestamp").reset_index(drop=True)
     _RAIN_CACHE.clear()
-    _WINDOW_CACHE.clear()  # windows are keyed by id(df); never reuse them across files
+    _WINDOW_CACHE.clear()  # windows/areas are keyed by id(df); never reuse them across files
+    _AREA_CACHE.clear()
     _RAIN_CACHE[key] = out
     return out
 
@@ -179,29 +180,48 @@ def _max_rolling(series: np.ndarray, n: int):
 class CellRain:
     rain24: np.ndarray        # (N,) max rolling 24 h total, mm
     max3h: np.ndarray         # (N,) max rolling 3 h total, mm
-    rain_index: np.ndarray    # (N,) rain24 + INTENSITY_WEIGHT * max3h
     peak_start: np.ndarray    # (N,) index into hours of the wettest 3 h window
     peak_len: int
     window: RainWindow
 
 
 def cell_rain(rain_df: pd.DataFrame, lat, lon, as_of, horizon_h: int) -> CellRain:
+    """Per-cell forecast statistics (IDW from the rainfall points) for [as_of, as_of + horizon_h)."""
     win = rain_window(rain_df, as_of, horizon_h)
     w = idw_weights(lat, lon, win.points)
     series = w @ win.mm.T                                 # (N, T) mm/h per cell
     rain24, _, _ = _max_rolling(series, 24)
     max3h, peak, plen = _max_rolling(series, config.PEAK_WINDOW_H)
-    return CellRain(rain24, max3h, rain24 + config.INTENSITY_WEIGHT * max3h, peak, plen, win)
+    return CellRain(rain24, max3h, peak, plen, win)
 
 
-def combine_risk(u, rain_index, k=config.RAIN_K, r0=config.RAIN_R0):
-    """risk = sigmoid(logit(u) + k * (rain_index - r0)); non-decreasing in rain_index.
+@dataclass
+class AreaRain:
+    """Study-area rainfall summary: sets the high / medium budgets for the whole grid."""
+    rain24: float     # mean over ALL study-area cells of the per-cell max rolling 24 h total, mm
+    max3h: float      # mean over ALL cells of the per-cell max rolling 3 h total, mm
+    severity: float
+    f_high: float
+    f_med: float
+    coverage: float
 
-    u is the susceptibility percentile (0-1). With light rain (< LIGHT_RAIN_MM) risk is
-    capped below the "high" band.
-    """
-    u = np.clip(np.asarray(u, float), *config.U_CLIP)
-    z = np.log(u / (1.0 - u)) + k * (np.asarray(rain_index, float) - r0)
-    risk = 1.0 / (1.0 + np.exp(-z))
-    return np.where(np.asarray(rain_index) < config.LIGHT_RAIN_MM,
-                    np.minimum(risk, config.LIGHT_RAIN_CAP), risk)
+
+_AREA_CACHE = {}
+
+
+def area_rain(rain_df: pd.DataFrame, lat_all, lon_all, as_of, horizon_h: int) -> AreaRain:
+    """Rain severity and budgets from the FULL study grid (never from the requested bbox), so a
+    street gets the same band in any viewport. Cached per (file, hour, horizon)."""
+    start = resolve_as_of(as_of).floor("h")
+    key = (id(rain_df), id(lat_all), start, int(horizon_h))
+    if key in _AREA_CACHE:
+        return _AREA_CACHE[key]
+    cr = cell_rain(rain_df, lat_all, lon_all, start, horizon_h)
+    r24, r3 = float(cr.rain24.mean()), float(cr.max3h.mean())
+    sev = budget.severity(r24, r3)
+    f_high, f_med = budget.budgets(sev)
+    out = AreaRain(r24, r3, sev, f_high, f_med, cr.window.coverage)
+    if len(_AREA_CACHE) > 16:
+        _AREA_CACHE.clear()
+    _AREA_CACHE[key] = out
+    return out

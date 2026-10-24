@@ -39,19 +39,33 @@ def _static_phrase(feature: str, value: float, median: float):
 
 
 def build_drivers(contribs, X, medians, rain24, window_h: int):
-    """contribs/X: (N, F) arrays in FEATURE_COLUMNS order; rain24: (N,) mm. Returns list[list[str]]."""
-    order = np.argsort(-contribs, axis=1)
+    """contribs/X: (N, F) arrays in FEATURE_COLUMNS order; rain24: (N,) mm. Returns list[list[str]].
+
+    Rain wording first (if any rain class is reached), then the strongest positive terrain contributions.
+    """
+    n, nf = contribs.shape
+    k = config.MAX_DRIVERS
+    order = np.argsort(-contribs, axis=1)[:, :k]
+    top = np.take_along_axis(contribs, order, axis=1)
+    above = (X > medians).astype(np.intp)                 # (N, F): 1 if the value is above its median
+    # phrase lookup per (feature, above-median); built once, not per cell
+    table = [[_static_phrase(FEATURE_COLUMNS[j], 1.0 if hi else -1.0, 0.0) for hi in (False, True)] for j in range(nf)]
+    span = "24 h" if window_h >= 24 else f"{window_h} h"
+    rain_cache = {}
     out = []
-    for i in range(contribs.shape[0]):
+    for i in range(n):
         reasons = []
-        label = rain_label(float(rain24[i]))
-        if label:
-            span = "24 h" if window_h >= 24 else f"{window_h} h"
-            reasons.append(f"{label} rain forecast: {rain24[i]:.0f} mm in {span}")
-        for j in order[i]:
-            if len(reasons) >= config.MAX_DRIVERS or contribs[i, j] < config.MIN_DRIVER_CONTRIB:
+        r = round(float(rain24[i]))
+        if r not in rain_cache:
+            label = rain_label(float(r))
+            rain_cache[r] = f"{label} rain forecast: {r:.0f} mm in {span}" if label else None
+        if rain_cache[r]:
+            reasons.append(rain_cache[r])
+        for slot in range(k):
+            if len(reasons) >= k or top[i, slot] < config.MIN_DRIVER_CONTRIB:
                 break
-            phrase = _static_phrase(FEATURE_COLUMNS[j], X[i, j], medians[j])
+            j = order[i, slot]
+            phrase = table[j][above[i, j]]
             if phrase not in reasons:
                 reasons.append(phrase)
         out.append(reasons or ["No strong risk factors"])

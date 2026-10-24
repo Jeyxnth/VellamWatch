@@ -45,7 +45,7 @@ def test_get_model_info(env):
     assert info["data_source"] == "synthetic"
     assert pd.Timestamp(info["trained_at"]).tzinfo is not None
     assert isinstance(info["data_dir"], str) and info["data_dir"]
-    assert info["rain_stage"] in ("fitted", "heuristic, not fitted")
+    assert info["rain_stage"] == "policy targets, not fitted"
 
 
 # ---- cells.geojson ----------------------------------------------------------------------------
@@ -192,4 +192,4 @@ def test_missing_events_csv_warns_and_uses_placeholder(env, tmp_path):
     (d / "events.csv").unlink()
     with pytest.warns(UserWarning, match="events.csv not found"):
         meta = train.train(d, tmp_path / "m3")
-    assert "UNVERIFIED" in meta["rain"]["note"] or meta["rain"]["fitted"] is False
+    assert meta["rain"]["fitted"] is False

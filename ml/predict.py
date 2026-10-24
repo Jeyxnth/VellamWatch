@@ -8,12 +8,17 @@ replayed with env ML_AS_OF (e.g. 2023-12-03T00:00:00+05:30 for Cyclone Michaung)
 predict_risk_at(..., as_of=...). Rainfall per cell is inverse-distance weighted (4 nearest
 points, power 2) from rainfall.parquet.
 
+Stage 2 is "budgeted ranking" (ml/budget.py): the rain severity of the WHOLE study grid sets how
+many cells are high/medium; each cell's susceptibility percentile over the FULL grid decides which.
+So a street gets the same band and rank in any viewport. Budgets are policy targets, not fitted.
+
 CLI: python -m ml.predict --bbox MIN_LAT MIN_LON MAX_LAT MAX_LON --horizon 24 [--as-of ISO]
 """
 import argparse
 import json
 import os
 import sys
+import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +27,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
-from ml import config, explain
+from ml import budget, config, explain
 from ml import rain as rainmod
 from ml.features import (FEATURE_COLUMNS, build_static_table, data_source, event_windows, find_data_dir,
                          percentile_rank)
@@ -38,14 +43,13 @@ class _State:
     meta: dict
     data_dir: Path
     cell_id: np.ndarray
+    cell_id_u: np.ndarray   # same ids as a fixed-width unicode array (fast lexsort)
     lat: np.ndarray
     lon: np.ndarray
     X: np.ndarray
     u: np.ndarray          # susceptibility percentile over ALL cells
     medians: np.ndarray
     contribs: np.ndarray   # (N, F) static XGBoost contributions; independent of rainfall, so cached
-    k: float
-    r0: float
 
 
 _STATE = {}
@@ -71,9 +75,7 @@ def get_model_info(data_dir=None) -> dict:
         "trained_at": meta["trained_at"],
         "data_dir": meta["data_dir"],
         "n_cells": meta["n_cells"],
-        "rain_stage": "fitted" if meta["rain"].get("fitted") else "heuristic, not fitted",
-        "rain_k": meta["rain"]["k"],
-        "rain_r0": meta["rain"]["r0"],
+        "rain_stage": meta["rain"]["label"],   # "policy targets, not fitted"
     }
 
 
@@ -101,9 +103,9 @@ def get_state(data_dir=None) -> _State:
     p = 1.0 / (1.0 + np.exp(-(meta["platt"]["a"] * m + meta["platt"]["b"])))
     contribs = booster.predict(xgb.DMatrix(X), pred_contribs=True)[:, :-1]
     _STATE.clear()
-    _STATE[key] = _State(booster, meta, d, table.cell_id.to_numpy(), table.lat.to_numpy(),
+    _STATE[key] = _State(booster, meta, d, table.cell_id.to_numpy(), table.cell_id.to_numpy().astype(str), table.lat.to_numpy(),
                          table.lon.to_numpy(), X, percentile_rank(p),
-                         np.asarray(meta["feature_medians"]), contribs, meta["rain"]["k"], meta["rain"]["r0"])
+                         np.asarray(meta["feature_medians"]), contribs)
     return _STATE[key]
 
 
@@ -126,10 +128,12 @@ def predict_risk_at(min_lat, min_lon, max_lat, max_lon, horizon_h, as_of=None, d
     if idx.size == 0:
         return []
     rain_df = rainmod.load_rainfall(st.data_dir)
-    cr = rainmod.cell_rain(rain_df, st.lat[idx], st.lon[idx], as_of_ts, horizon_h)
-
-    score = np.round(rainmod.combine_risk(st.u[idx], cr.rain_index, st.k, st.r0), 3)
-    drivers = explain.build_drivers(st.contribs[idx], st.X[idx], st.medians, cr.rain24, len(cr.window.hours))
+    cr = rainmod.cell_rain(rain_df, st.lat[idx], st.lon[idx], as_of_ts, horizon_h)   # peak windows only
+    area = rainmod.area_rain(rain_df, st.lat, st.lon, as_of_ts, horizon_h)   # FULL grid, not the bbox
+    score, band = budget.risk_scores(st.u[idx], area.f_high, area.f_med)
+    bands = budget.band_names(band)
+    drivers = explain.build_drivers(st.contribs[idx], st.X[idx], st.medians,
+                                    np.full(idx.size, area.rain24), len(cr.window.hours))
 
     # ISO strings are built once per forecast hour, not once per cell (pandas boxing is slow)
     hours = cr.window.hours
@@ -137,19 +141,44 @@ def predict_risk_at(min_lat, min_lon, max_lat, max_lon, horizon_h, as_of=None, d
     starts = cr.peak_start
     ends = starts + cr.peak_len
     scores = score.tolist()
+    # best first; ties broken by cell_id so the order is deterministic
+    rank = np.lexsort((st.cell_id_u[idx], -score))
+    ids, lats, lons = st.cell_id[idx].tolist(), st.lat[idx].tolist(), st.lon[idx].tolist()
+    starts_l, ends_l = starts.tolist(), ends.tolist()
     out = [{
-        "cell_id": cid, "lat": lat, "lon": lon, "risk_score": sc, "risk_band": config.risk_band(sc),
-        "peak_window": {"start": iso[a], "end": iso[b]}, "drivers": dr,
-    } for cid, lat, lon, sc, a, b, dr in zip(
-        st.cell_id[idx].tolist(), st.lat[idx].tolist(), st.lon[idx].tolist(), scores,
-        starts.tolist(), ends.tolist(), drivers)]
-    out.sort(key=lambda c: (-c["risk_score"], c["cell_id"]))
+        "cell_id": ids[j], "lat": lats[j], "lon": lons[j], "risk_score": scores[j], "risk_band": bands[j],
+        "peak_window": {"start": iso[starts_l[j]], "end": iso[ends_l[j]]}, "drivers": drivers[j],
+    } for j in rank.tolist()]
     return out
 
 
 def predict_risk(min_lat, min_lon, max_lat, max_lon, horizon_h):
     """Contract signature. as_of comes from env ML_AS_OF, else now (IST)."""
     return predict_risk_at(min_lat, min_lon, max_lat, max_lon, horizon_h)
+
+
+def warm_up(data_dir=None) -> dict:
+    """Load the model and data, fill the caches and run one tiny prediction (call once at startup).
+
+    Returns get_model_info() plus the timings and the as_of used. If the forecast window for "now"
+    is not covered by rainfall.parquet (e.g. a stale synthetic forecast) the warm-up falls back to the
+    last 24 h of data so it never fails just because the forecast is old.
+    """
+    t0 = time.perf_counter()
+    st = get_state(data_dir)
+    info = get_model_info(data_dir)
+    box = (float(st.lat.min()), float(st.lon.min()), float(st.lat.min()) + 0.01, float(st.lon.min()) + 0.01)
+    as_of = None
+    try:
+        predict_risk_at(*box, 24, data_dir=data_dir)
+    except rainmod.NoRainfallError:
+        rain_df = rainmod.load_rainfall(st.data_dir)
+        as_of = (rain_df.timestamp.max() - pd.Timedelta(hours=24)).isoformat()
+        predict_risk_at(*box, 24, as_of=as_of, data_dir=data_dir)
+        warnings.warn(f"rainfall has no data for the current time; warmed up with as_of={as_of}")
+    info["warm_up_s"] = round(time.perf_counter() - t0, 2)
+    info["warm_up_as_of"] = as_of
+    return info
 
 
 def main(argv=None):

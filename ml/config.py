@@ -67,29 +67,50 @@ CV_SPLITS = 5
 CV_BUFFER_CELLS = 2
 LOCAL_RELIEF_RADIUS_CELLS = 2  # 5x5 window, ~1.25 km across
 
-# ---- stage 2: rainfall conditioning ----------------------------------------
-# risk logit = logit(u) + RAIN_K * (rain_index - RAIN_R0)
-# u = percentile rank (0-1) of the cell's calibrated susceptibility over the whole grid.
-# Why a percentile: hotspot base rate is only a few percent, so a raw probability
-# could never reach the "high" band. The percentile keeps the ranking and lets
-# rainfall decide how many cells turn amber/red.
-RAIN_K = 0.05          # per mm. heuristic, not fitted (replaced if fitted on events)
-RAIN_R0 = 100.0        # mm of rain_index at which a median-susceptible cell is at 50 %. heuristic
-RAIN_K_BOUNDS = (0.005, 0.3)
-RAIN_R0_BOUNDS = (30.0, 250.0)
-RAIN_FIT_MIN_SPREAD_MM = 20.0   # min difference in event rain_index needed to fit
-RAIN_FIT_MIN_COVERAGE = 0.9
+# ---- stage 2: budgeted ranking ---------------------------------------------------
+# Rain severity decides HOW MUCH of the study area is at risk (a budget of high / medium
+# cells); the stage-1 susceptibility percentile decides WHICH cells. Every number below is a
+# POLICY TARGET or heuristic. NOTHING in this section is fitted to data.
+#
+# rain_severity in [0, 1] = max( sev24(24 h total), sev3(max 3 h total) ), both piecewise-linear,
+# monotone, evaluated on the study-area mean of the per-cell forecast (IDW from rainfall points).
+SEVERITY_24H_KNOTS = [     # (mm in 24 h, severity). IMD-style lower bounds, VERIFY against IMD.
+    (15.6, 0.0),           # below this: light rain, nothing flagged
+    (64.5, 1 / 3),         # heavy
+    (115.6, 2 / 3),        # very heavy
+    (204.5, 1.0),          # extremely heavy
+]
+SEVERITY_3H_KNOTS = [      # (mm in the wettest 3 h, severity). Heuristic, NOT an IMD table. VERIFY.
+    (10.0, 0.0),
+    (40.0, 1 / 3),
+    (70.0, 2 / 3),
+    (120.0, 1.0),
+]
 
-# rain_index = (max rolling 24 h total) + INTENSITY_WEIGHT * (max rolling 3 h total), in mm
-INTENSITY_WEIGHT = 0.5
-LIGHT_RAIN_MM = 15.6   # below this rain_index risk is capped under the "high" band
-LIGHT_RAIN_CAP = BAND_HIGH - 0.01
-U_CLIP = (0.02, 0.98)
+# Policy: share of ALL study-area cells that are "high" / "medium-or-high", by 24 h rain total (mm).
+# Interpolated in severity space between these points; constant beyond the last point.
+HIGH_BUDGET_24H = [(25, 0.0), (50, 0.025), (100, 0.15), (150, 0.30), (200, 0.40)]
+# Rule for the medium budget (cumulative, includes high): about 2x the high budget, plus a small
+# early "watch" band; nothing at light rain.
+MED_BUDGET_24H = [(15.6, 0.0), (25, 0.02), (50, 0.06), (100, 0.30), (150, 0.60), (200, 0.80)]
+HIGH_CAP = 0.50    # the high band never exceeds this share of study-area cells
+MED_CAP = 0.80     # medium-or-high never exceeds this share
+LIGHT_RAIN_MM = 15.6   # 24 h total below this (and light 3 h rain) counts as "light rain" in tests/reports
+
+# Policy check ranges (BACKTEST.md section D and tests): allowed high-cell share by 24 h total.
+POLICY_HIGH_RANGE = {0: (0.0, 0.0), 25: (0.0, 0.0), 50: (0.0, 0.03), 100: (0.10, 0.20),
+                     150: (0.25, 0.35), 200: (0.35, 0.50)}
+CHECK_TOTALS_MM = (0, 25, 50, 100, 150, 200)
+CHECK_PROFILES = {                         # share of the 24 h total that falls in the wettest 3 h
+    "uniform over 24 h": 3 / 24,
+    "burst: half of it in 3 h": 0.5,
+}
+
 PEAK_WINDOW_H = 3
 IDW_POWER = 2.0
 IDW_NEAREST = 4
 
-# IMD-style 24 h rainfall classes in mm (lower bounds). VERIFY against IMD before quoting.
+# IMD-style 24 h rainfall classes in mm (lower bounds), used for driver wording. VERIFY against IMD.
 RAIN_BANDS_24H = [
     ("Moderate", 15.6),
     ("Heavy", 64.5),
@@ -104,16 +125,6 @@ EVENTS_TODO = {
     "2015": ("2015-12-01T00:00:00+05:30", "2015-12-04T00:00:00+05:30"),
     "2023": ("2023-12-02T00:00:00+05:30", "2023-12-06T00:00:00+05:30"),  # Cyclone Michaung
 }
-
-# ---- band-share check (BACKTEST.md section C) ---------------------------------
-BAND_CHECK_TOTALS_MM = (0, 25, 50, 100, 150, 200)      # 24 h rainfall scenarios
-BAND_CHECK_PROFILES = {                                  # share of the 24 h total falling in the wettest 3 h
-    "uniform over 24 h": 3 / 24,
-    "burst: half of it in 3 h": 0.5,
-}
-BAND_CHECK_AT_MM = 100
-BAND_CHECK_MAX_HIGH_SHARE = 0.35   # above this at 100 mm, BACKTEST.md PROPOSES (never applies) changes
-BAND_CHECK_TARGET_HIGH_SHARE = 0.20
 
 # ---- explanations ----------------------------------------------------------
 MIN_DRIVER_CONTRIB = 0.15  # min XGBoost contribution (log-odds) for a static driver

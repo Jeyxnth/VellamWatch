@@ -20,7 +20,7 @@ def test_training_is_deterministic(env, tmp_path):
 def test_meta_states_synthetic_source(env):
     meta = json.loads((env["art"] / "model_synthetic" / "meta.json").read_text())
     assert meta["data_source"] == "synthetic" and meta["banner"] == config.SYNTHETIC_BANNER
-    assert meta["rain"]["k_source"] and meta["rain"]["r0_source"]
+    assert meta["rain"]["fitted"] is False and meta["rain"]["label"] == "policy targets, not fitted"
 
 
 def test_missing_feature_file_error_names_the_file(env, tmp_path):

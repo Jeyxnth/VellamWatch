@@ -19,17 +19,6 @@ def test_heavy_rain_produces_high_cells(env):
     assert any("rain forecast" in dr for c in cells[:20] for dr in c["drivers"])
 
 
-def test_combine_risk_monotone_in_rain():
-    u = np.linspace(0.001, 0.999, 200)
-    prev = None
-    for ri in np.linspace(0, 400, 401):
-        cur = rain.combine_risk(u, ri)
-        if prev is not None:
-            assert np.all(cur >= prev - 1e-12)
-        prev = cur
-    assert rain.combine_risk(u, 0.0).max() < config.BAND_HIGH
-
-
 def test_end_to_end_monotone_in_rainfall(env):
     scores = []
     for i, scale in enumerate((0.0, 0.5, 1.0, 2.0)):

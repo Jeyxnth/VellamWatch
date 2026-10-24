@@ -2,8 +2,8 @@
 
 Stage 1: XGBoost susceptibility (static terrain -> P(hotspot)), calibrated on
          spatial-block out-of-fold predictions.
-Stage 2: rainfall conditioning parameters (k, r0); fitted on past events when
-         possible, otherwise documented heuristic defaults.
+Stage 2: budgeted ranking (ml/budget.py). Nothing is fitted: the rain-to-budget
+         table is a policy target in config.py. Training only checks the rainfall data.
 
 Run: python -m ml.train [--data-dir DIR]
 """
@@ -16,7 +16,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from scipy.optimize import minimize
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score
 
@@ -24,7 +23,7 @@ from ml import config
 from ml import rain as rainmod
 from ml.features import (FEATURE_COLUMNS, MONOTONE, build_static_table, data_source,
                          event_windows, find_data_dir, load_hotspots, make_labels,
-                         percentile_rank, spatial_block_folds)
+                         spatial_block_folds)
 
 
 def _display_path(d) -> str:
@@ -76,77 +75,36 @@ def sigmoid(z):
     return 1.0 / (1.0 + np.exp(-z))
 
 
-def fit_rain_params(table, hotspots, data_dir, u_oof) -> dict:
-    """Fit k and r0 from past events via a logistic model with offset logit(u_oof).
-
-    z = logit(u) + k * rain_index + b, r0 = -b / k, samples = (cell, event).
-    Needs events with dates, hotspots and rainfall coverage, and at least
-    RAIN_FIT_MIN_SPREAD_MM between event rain indexes. Otherwise defaults are kept.
-    """
-    res = {"k": config.RAIN_K, "r0": config.RAIN_R0, "fitted": False,
-           "k_source": "heuristic, not fitted", "r0_source": "heuristic, not fitted", "note": ""}
+def check_rain_data(data_dir, hotspots) -> None:
+    """Warn (never crash) about event dates and rainfall coverage problems. Fits nothing."""
     windows, win_src = event_windows(data_dir)
     if "UNVERIFIED" in win_src:
         warnings.warn(f"events.csv not found in {data_dir}; using {win_src}")
     unknown = sorted(set(hotspots.event) - set(windows))
     if unknown:
-        warnings.warn(f"hotspots.csv events {unknown} have no entry in events.csv; they are ignored for rain fitting")
+        warnings.warn(f"hotspots.csv events {unknown} have no entry in events.csv; they are ignored for rain checks")
     try:
         rain_df = rainmod.load_rainfall(data_dir)
-    except FileNotFoundError as e:
-        res["note"] = f"rain params not fitted: {e}"
-        return res
+    except FileNotFoundError:
+        return  # predict/backtest report the missing file with a clear message
     for msg in rainmod.coverage_warnings(rain_df, windows):
         warnings.warn(msg)
-    samples = []  # (event, y, rain_index per cell)
-    skipped = []
-    for event, (start, end) in windows.items():
-        y, _, _ = make_labels(table, hotspots, [event])
-        if y.sum() == 0:
-            skipped.append(f"{event}: no hotspots")
-            continue
-        hours = int((end - start) / np.timedelta64(1, "h"))
-        try:
-            cr = rainmod.cell_rain(rain_df, table.lat.to_numpy(), table.lon.to_numpy(), start, hours)
-        except rainmod.NoRainfallError:
-            skipped.append(f"{event}: no rainfall data in window")
-            continue
-        if cr.window.coverage < config.RAIN_FIT_MIN_COVERAGE:
-            skipped.append(f"{event}: rainfall coverage {cr.window.coverage:.0%}")
-            continue
-        samples.append((event, y, cr.rain_index))
-    if len(samples) < 2:
-        res["note"] = f"need >= 2 events with hotspots and rainfall to fit; usable: {len(samples)}; skipped: {skipped}"
-        return res
-    means = [float(s[2].mean()) for s in samples]
-    if max(means) - min(means) < config.RAIN_FIT_MIN_SPREAD_MM:
-        res["note"] = f"event rain indexes too similar to fit ({means}); defaults kept"
-        return res
 
-    offset = np.log(np.clip(u_oof, *config.U_CLIP) / (1 - np.clip(u_oof, *config.U_CLIP)))
-    y_all = np.concatenate([s[1] for s in samples]).astype(float)
-    x_all = np.concatenate([s[2] for s in samples])
-    off_all = np.tile(offset, len(samples))
 
-    def nll(theta):
-        z = off_all + theta[0] * x_all + theta[1]
-        return float(np.sum(np.logaddexp(0.0, z) - y_all * z))
-
-    fit = minimize(nll, x0=[config.RAIN_K, -config.RAIN_K * config.RAIN_R0],
-                   bounds=[(0.0, 0.5), (-60.0, 10.0)], method="L-BFGS-B")
-    names = [s[0] for s in samples]
-    k_hat = float(fit.x[0])
-    r0_hat = float(-fit.x[1] / k_hat) if k_hat > 1e-6 else float("nan")
-    k_ok = config.RAIN_K_BOUNDS[0] < k_hat < config.RAIN_K_BOUNDS[1]
-    r0_ok = config.RAIN_R0_BOUNDS[0] < r0_hat < config.RAIN_R0_BOUNDS[1]
-    if k_ok and r0_ok:  # k and r0 are only meaningful together; accept both or neither
-        res.update(k=k_hat, r0=r0_hat, fitted=True, k_source=f"fitted on events {names}", r0_source=f"fitted on events {names}")
-    else:
-        res["note"] += (f"fit rejected (k={k_hat:.4f}, r0={r0_hat:.1f} outside bounds {config.RAIN_K_BOUNDS} / "
-                        f"{config.RAIN_R0_BOUNDS}); heuristic defaults kept for both. ")
-    idx_mm = {n: round(m, 1) for n, m in zip(names, means)}
-    res["note"] += f"event mean rain_index mm={idx_mm}; event dates from {win_src}."
-    return res
+def rain_stage_description() -> dict:
+    """What goes into meta.json: the policy, clearly labelled as not fitted."""
+    return {
+        "stage": "budgeted ranking: rain severity sets the share of high/medium cells, "
+                 "susceptibility percentile picks which",
+        "fitted": False,
+        "label": "policy targets, not fitted",
+        "severity_24h_knots": config.SEVERITY_24H_KNOTS,
+        "severity_3h_knots": config.SEVERITY_3H_KNOTS,
+        "high_budget_24h": config.HIGH_BUDGET_24H,
+        "med_budget_24h": config.MED_BUDGET_24H,
+        "high_cap": config.HIGH_CAP,
+        "med_cap": config.MED_CAP,
+    }
 
 
 def train(data_dir=None, artifact_dir=None, verbose=False) -> dict:
@@ -165,10 +123,8 @@ def train(data_dir=None, artifact_dir=None, verbose=False) -> dict:
     folds = spatial_block_folds(table.row, table.col)
     oof = oof_margins(X, y_train, w, folds)
     a, b = fit_platt(oof, y_true)
-    p_oof = sigmoid(a * oof + b)
-    u_oof = percentile_rank(p_oof)
     booster = fit_booster(X, y_train, w)
-    rain_params = fit_rain_params(table, hotspots, d, u_oof)
+    check_rain_data(d, hotspots)
 
     out.mkdir(parents=True, exist_ok=True)
     booster.save_model(str(out / "model.json"))
@@ -186,7 +142,7 @@ def train(data_dir=None, artifact_dir=None, verbose=False) -> dict:
         "platt": {"a": a, "b": b},
         "oof_pr_auc": float(average_precision_score(y_true, oof)),
         "base_rate": n_pos / len(table),
-        "rain": rain_params,
+        "rain": rain_stage_description(),
         "seed": config.SEED,
         "xgb_params": config.XGB_PARAMS,
         "neighbour_weight": config.NEIGHBOUR_WEIGHT,
@@ -207,10 +163,7 @@ def main(argv=None):
     print(f"data source : {meta['data_source'].upper()}  ({meta['data_dir']})")
     print(f"cells       : {meta['n_cells']}  hotspot cells: {meta['n_hotspot_cells']} {meta['hotspot_cells_per_event']}")
     print(f"OOF PR-AUC  : {meta['oof_pr_auc']:.3f}  (base rate {meta['base_rate']:.3f}, spatial block CV)")
-    r = meta["rain"]
-    print(f"rain k={r['k']:.4f} ({r['k_source']}), r0={r['r0']:.1f} ({r['r0_source']})")
-    if r["note"]:
-        print(f"note        : {r['note']}")
+    print(f"rain stage  : {meta['rain']['label']} (see ml/config.py)")
     print(f"artifacts   : {config.model_dir(meta['data_source'])}")
     return 0
 
