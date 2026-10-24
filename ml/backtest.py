@@ -21,7 +21,7 @@ import pandas as pd  # noqa: E402
 from sklearn.linear_model import LogisticRegression  # noqa: E402
 from sklearn.metrics import average_precision_score, precision_recall_curve  # noqa: E402
 
-from ml import config  # noqa: E402
+from ml import budget, config  # noqa: E402
 from ml import predict as predmod  # noqa: E402
 from ml import rain as rainmod  # noqa: E402
 from ml import train as trainmod  # noqa: E402
@@ -137,16 +137,26 @@ def event_holdout(table, hotspots, events):
     return rows, curves
 
 
-# ---- C. event replay through the rainfall stage --------------------------------------------
+# ---- C. event replay through the budgeted rainfall stage ------------------------------------
 REPLAY_HORIZON_H = 72
 
 
-def event_replay(table, hotspots, events, windows, rain_df, k, r0):
-    """Train stage 1 on event a's hotspots, replay event b via as_of = start of b's window.
+def _top_budget(score, n):
+    """Boolean mask of the n highest-scoring cells (stable, ties by index)."""
+    mask = np.zeros(len(score), bool)
+    mask[_order(score)[:n]] = True
+    return mask
 
-    Reports how many of b's hotspot cells land in the high band vs. how many of ALL cells do.
+
+def event_replay(table, hotspots, events, windows, rain_df):
+    """Train stage 1 on event a's hotspots only; replay event b with as_of = start of b's window.
+
+    Reports (a) recall: share of b's hotspot cells that land in the HIGH band, (b) the share of ALL
+    cells that are high, (c) lift = recall / share. The baseline is lowest-elevation-first given the
+    SAME number of high cells. Also reported for medium+high and for 'new' hotspots (not in event a).
     """
     X = table[FEATURE_COLUMNS].to_numpy(float)
+    elev_score = lowest_elevation_score(table, np.arange(len(table)))
     rows = []
     for a in events:
         for b in events:
@@ -157,85 +167,69 @@ def event_replay(table, hotspots, events, windows, rain_df, k, r0):
             if y_a.sum() < 5 or y_b.sum() == 0:
                 continue
             try:
-                cr = rainmod.cell_rain(rain_df, table.lat.to_numpy(), table.lon.to_numpy(),
-                                       windows[b][0], REPLAY_HORIZON_H)
-            except rainmod.NoRainfallError as e:
-                rows.append({"train": a, "replay": b, "error": str(e)})
+                area = rainmod.area_rain(rain_df, table.lat.to_numpy(), table.lon.to_numpy(),
+                                         windows[b][0], REPLAY_HORIZON_H)
+            except rainmod.NoRainfallError:
+                rows.append({"train": a, "replay": b, "error": "no rainfall data in that event window"})
                 continue
             booster = trainmod.fit_booster(X, y_a_train, w)
             u = percentile_rank(trainmod.margins(booster, X))
-            risk = np.round(rainmod.combine_risk(u, cr.rain_index, k, r0), 3)
-            high = risk >= config.BAND_HIGH
-            medhigh = risk >= config.BAND_MEDIUM
-            new = y_b.astype(bool) & (y_a == 0)
-            rows.append({
-                "train": a, "replay": b, "as_of": windows[b][0].isoformat(), "n_hot": int(y_b.sum()),
-                "n_new": int(new.sum()), "rain24_mean": float(cr.rain24.mean()),
-                "hot_high": float(high[y_b == 1].mean()), "hot_medhigh": float(medhigh[y_b == 1].mean()),
-                "new_high": float(high[new].mean()) if new.any() else float("nan"),
-                "cells_high": float(high.mean()), "cells_medhigh": float(medhigh.mean()),
-            })
+            _, band = budget.risk_scores(u, area.f_high, area.f_med)
+            hot = y_b == 1
+            new = hot & (y_a == 0)
+            row = {"train": a, "replay": b, "as_of": windows[b][0].isoformat(), "n_hot": int(hot.sum()),
+                   "n_new": int(new.sum()), "rain24": area.rain24, "severity": area.severity,
+                   "f_high": area.f_high, "f_med": area.f_med}
+            for name, mask in (("high", band == 2), ("medhigh", band >= 1)):
+                n = int(mask.sum())
+                base_mask = _top_budget(elev_score, n)
+                share = n / len(mask)
+                row[f"{name}_share"] = share
+                for tag, sel in (("", hot), ("_new", new)):
+                    if sel.any() and n > 0:
+                        rec, rec_b = float(mask[sel].mean()), float(base_mask[sel].mean())
+                        row[f"{name}_recall{tag}"], row[f"{name}_lift{tag}"] = rec, rec / share
+                        row[f"{name}_base_recall{tag}"], row[f"{name}_base_lift{tag}"] = rec_b, rec_b / share
+                    else:
+                        for k in ("recall", "lift", "base_recall", "base_lift"):
+                            row[f"{name}_{k}{tag}"] = float("nan")
+            rows.append(row)
     return rows
 
 
-# ---- D. band-share report ------------------------------------------------------------------
-def rain_index_for(total_mm, max3h_share):
-    """Rain index for a 24 h total whose wettest 3 h hold `max3h_share` of it."""
-    return total_mm * (1 + config.INTENSITY_WEIGHT * max3h_share)
-
-
-def band_shares(u, rain_index, k, r0):
-    risk = np.round(rainmod.combine_risk(u, rain_index, k, r0), 3)
-    high = risk >= config.BAND_HIGH
-    med = (risk >= config.BAND_MEDIUM) & ~high
-    return float((~high & ~med).mean()), float(med.mean()), float(high.mean())
-
-
-def band_distribution(u, k, r0):
-    """Rows (24 h mm, profile, rain index, low, medium, high) for the config.BAND_CHECK_* scenarios."""
+# ---- D. budget check -------------------------------------------------------------------------
+def budget_check(u):
+    """Rows for bursty/uniform storms at each rain level, with the policy range and PASS/FAIL."""
+    tol = 1.0 / len(u) + 1e-6   # discretisation: shares move in steps of one cell
     rows = []
-    for total in config.BAND_CHECK_TOTALS_MM:
-        for name, share in config.BAND_CHECK_PROFILES.items():
-            ri = rain_index_for(total, share)
-            rows.append((total, name, ri, *band_shares(u, ri, k, r0)))
+    for total in config.CHECK_TOTALS_MM:
+        lo, hi = config.POLICY_HIGH_RANGE[total]
+        for name, share3 in config.CHECK_PROFILES.items():
+            sev = budget.severity(total, total * share3)
+            f_high, f_med = budget.budgets(sev)
+            low_s, med_s, high_s = budget.shares(u, f_high, f_med)
+            ok = (lo - tol <= high_s <= hi + tol) and high_s <= config.HIGH_CAP + tol
+            rows.append({"total": total, "profile": name, "max3h": total * share3, "severity": sev,
+                         "low": low_s, "medium": med_s, "high": high_s, "range": (lo, hi), "ok": ok})
     return rows
 
 
-def band_proposal(u, k, r0):
-    """If too many cells are high at 100 mm, PROPOSE (never apply) an r0 or threshold change."""
-    shares = {name: band_shares(u, rain_index_for(config.BAND_CHECK_AT_MM, s), k, r0)[2]
-              for name, s in config.BAND_CHECK_PROFILES.items()}
-    worst = max(shares.values())
-    if worst <= config.BAND_CHECK_MAX_HIGH_SHARE:
-        return None
-    burst = rain_index_for(config.BAND_CHECK_AT_MM, max(config.BAND_CHECK_PROFILES.values()))
-    target = config.BAND_CHECK_TARGET_HIGH_SHARE
-    lo, hi = 0.0, 500.0
-    for _ in range(60):  # larger r0 -> fewer high cells
-        mid = (lo + hi) / 2
-        if band_shares(u, burst, k, mid)[2] > target:
-            lo = mid
-        else:
-            hi = mid
-    r0_new = (lo + hi) / 2
-    risk = np.round(rainmod.combine_risk(u, burst, k, r0), 3)
-    return {
-        "worst_high_share": worst, "target": target, "r0_new": r0_new,
-        "threshold_new": float(np.quantile(risk, 1 - target)),
-        "shares_with_r0": {name: band_shares(u, rain_index_for(config.BAND_CHECK_AT_MM, s), k, r0_new)[2]
-                           for name, s in config.BAND_CHECK_PROFILES.items()},
-    }
-
-
-def monotone_ok(u, k, r0) -> bool:
-    grid = np.linspace(0, 400, 161)
-    prev = None
-    for ri in grid:
-        cur = rainmod.combine_risk(u, ri, k, r0)
-        if prev is not None and np.any(cur < prev - 1e-12):
-            return False
-        prev = cur
-    return True
+def property_checks(u) -> dict:
+    """(a) light rain flags nothing, (b) risk never decreases with rain, (c) cell order never changes."""
+    totals = np.linspace(0, 400, 161)
+    prev, mono, rank_ok = None, True, True
+    order = np.argsort(u, kind="stable")
+    for t in totals:
+        f_high, f_med = budget.budgets(budget.severity(t, t / 8))
+        score, _ = budget.risk_scores(u, f_high, f_med)
+        if prev is not None and np.any(score < prev - 1e-12):
+            mono = False
+        if np.any(np.diff(score[order]) < -1e-12):
+            rank_ok = False
+        prev = score
+    f_high, f_med = budget.budgets(budget.severity(config.LIGHT_RAIN_MM - 0.1, 5.0))
+    _, band = budget.risk_scores(u, f_high, f_med)
+    return {"light_rain_clean": bool((band == 0).all()), "monotone": mono, "rank_preserving": rank_ok}
 
 
 # ---- plots ---------------------------------------------------------------------------------
@@ -299,10 +293,9 @@ def _metric_table(rows):
     return "\n".join(lines)
 
 
-def render_markdown(meta, n_folds, cv_results, holdout_rows, replay_rows, bands, proposal, mono, events, win_src, plot_rel):
+def render_markdown(meta, n_folds, cv_results, holdout_rows, replay_rows, bands, props, events, win_src, plot_rel):
     src = meta["data_source"]
-    r_cfg0 = meta["rain"]["r0"]
-    rain_label = "fitted on past events" if meta["rain"].get("fitted") else "heuristic, not fitted"
+    rain_label = meta["rain"]["label"]
     L = []
     if src == "synthetic":
         L += [f"# **{config.SYNTHETIC_BANNER}**", "",
@@ -339,59 +332,71 @@ def render_markdown(meta, n_folds, cv_results, holdout_rows, replay_rows, bands,
                 L += [f"**Train {a} -> test {b}, {variant}** (n_pos={n_pos}, base rate {rows[0][1]['base_rate']:.3f})", "",
                       _metric_table(rows), ""]
 
-    L += ["## C. Event replay through the rainfall stage", ""]
+    L += ["## C. Event replay through the budgeted rainfall stage", ""]
     if not replay_rows:
         L += ["Not run (needs two events with hotspots and rainfall covering the event windows).", ""]
     else:
         L += [f"Stage 1 is trained on one event's hotspots only; the other event is replayed with as_of = start of its "
-              f"window, horizon {REPLAY_HORIZON_H} h, through the full risk pipeline (contract band thresholds). "
-              f"Rainfall stage: **{rain_label}**. A useful result has far more of the event's hotspots in the high band "
-              "than cells overall. 'New' = hotspots of the replayed event that were not hotspots in the training event.", "",
-              "| Train | Replay (as_of) | mean rain24 (mm) | hotspots | hotspots in HIGH | new hotspots in HIGH | "
-              "ALL cells in HIGH | hotspots medium+high | ALL cells medium+high |",
-              "|---|---|---|---|---|---|---|---|---|"]
+              f"window, horizon {REPLAY_HORIZON_H} h. Rain severity sets how many cells are high; the stage-1 ranking picks "
+              "which. **Recall** = share of the replayed event's hotspot cells in the HIGH band; **lift** = recall / share "
+              "of all cells that are high (random = 1.0). The baseline flags the lowest-elevation cells using the SAME "
+              f"number of high cells. Rain stage: **{rain_label}**.", "",
+              "| Train | Replay (as_of) | area rain24 (mm) | severity | high budget | hotspots | recall (ours) | "
+              "recall (low-elev) | lift (ours) | lift (low-elev) | new-hotspot recall (ours / low-elev) |",
+              "|---|---|---|---|---|---|---|---|---|---|---|"]
         for r in replay_rows:
             if "error" in r:
-                L.append(f"| {r['train']} | {r['replay']} | not run: no rainfall in that window | | | | | | |")
+                L.append(f"| {r['train']} | {r['replay']} | not run: {r['error']} | | | | | | | | |")
                 continue
-            new_txt = "n/a" if np.isnan(r["new_high"]) else f"{r['new_high']:.1%} (n={r['n_new']})"
-            L.append(f"| {r['train']} | {r['replay']} ({r['as_of']}) | {r['rain24_mean']:.0f} | {r['n_hot']} | "
-                     f"{r['hot_high']:.1%} | {new_txt} | {r['cells_high']:.1%} | {r['hot_medhigh']:.1%} | "
-                     f"{r['cells_medhigh']:.1%} |")
+            if r["f_high"] == 0 or np.isnan(r["high_recall"]):
+                L.append(f"| {r['train']} | {r['replay']} ({r['as_of']}) | {r['rain24']:.0f} | {r['severity']:.2f} | "
+                         "0% (no high cells at this rainfall) | %d | n/a | n/a | n/a | n/a | n/a |" % r["n_hot"])
+                continue
+            new_txt = ("n/a" if np.isnan(r["high_recall_new"]) else
+                       f"{r['high_recall_new']:.1%} / {r['high_base_recall_new']:.1%} (n={r['n_new']})")
+            L.append(f"| {r['train']} | {r['replay']} ({r['as_of']}) | {r['rain24']:.0f} | {r['severity']:.2f} | "
+                     f"{r['f_high']:.1%} | {r['n_hot']} | {r['high_recall']:.1%} | {r['high_base_recall']:.1%} | "
+                     f"{r['high_lift']:.2f}x | {r['high_base_lift']:.2f}x | {new_txt} |")
+        L += ["", "Medium+high (same replay):", "",
+              "| Train | Replay | medium+high budget | recall (ours) | recall (low-elev) | lift (ours) | lift (low-elev) |",
+              "|---|---|---|---|---|---|---|"]
+        for r in replay_rows:
+            if "error" in r or np.isnan(r.get("medhigh_recall", float("nan"))):
+                continue
+            L.append(f"| {r['train']} | {r['replay']} | {r['medhigh_share']:.1%} | {r['medhigh_recall']:.1%} | "
+                     f"{r['medhigh_base_recall']:.1%} | {r['medhigh_lift']:.2f}x | {r['medhigh_base_lift']:.2f}x |")
         L.append("")
 
-    L += ["## D. Band-share report", "",
-          f"Share of ALL grid cells per band for a 24 h rainfall total. Rain index = rain24 + "
-          f"{config.INTENSITY_WEIGHT} x (wettest 3 h); the two profiles bracket how peaked the storm is. "
-          f"Bands: low < {config.BAND_MEDIUM}, medium < {config.BAND_HIGH}, high >= {config.BAND_HIGH}. "
-          f"Rainfall stage: **{rain_label}**.", "",
-          "| 24 h rain (mm) | profile | rain index (mm) | low | medium | high |", "|---|---|---|---|---|---|"]
-    for total, prof, ri, lo, me, hi in bands:
-        L.append(f"| {total} | {prof} | {ri:.1f} | {lo:.1%} | {me:.1%} | {hi:.1%} |")
-    L += ["", f"Risk non-decreasing in rainfall for every cell (0-400 mm grid): **{'PASS' if mono else 'FAIL'}**. "
-          f"With rain index below {config.LIGHT_RAIN_MM} mm risk is capped below the high band.", ""]
-    if proposal:
-        shares = ", ".join(f"{h:.0%} ({p})" for p, h in proposal["shares_with_r0"].items())
-        L += [f"### PROPOSAL (not applied): too many high cells at {config.BAND_CHECK_AT_MM} mm", "",
-              f"{proposal['worst_high_share']:.0%} of cells are high at {config.BAND_CHECK_AT_MM} mm, above the "
-              f"{config.BAND_CHECK_MAX_HIGH_SHARE:.0%} guideline. Nothing in `config.py` was changed. Options for the lead:", "",
-              f"1. Raise `RAIN_R0` from {r_cfg0:.0f} to about **{proposal['r0_new']:.0f}** (k unchanged). "
-              f"High share at {config.BAND_CHECK_AT_MM} mm would become {shares}.",
-              f"2. Or raise `BAND_HIGH` (a contract change) from {config.BAND_HIGH} to about "
-              f"**{proposal['threshold_new']:.2f}** to get ~{proposal['target']:.0%} high cells in the burst scenario.", "",
-              "Either choice is a judgement about how alarming the map should look; neither is fitted to real flood data.", ""]
+    L += ["## D. Budget check", "",
+          "Share of ALL study-area cells per band for a 24 h rainfall total, for a uniform storm and a bursty storm "
+          f"(half of the total in the wettest 3 h). Bands: low < {config.BAND_MEDIUM}, medium < {config.BAND_HIGH}, "
+          f"high >= {config.BAND_HIGH}. The policy range is a TARGET set in `config.py` (not fitted); the high band is capped at "
+          f"{config.HIGH_CAP:.0%}. Rain stage: **{rain_label}**.", "",
+          "| 24 h rain (mm) | storm | wettest 3 h (mm) | severity | low | medium | high | policy range for high | in range |",
+          "|---|---|---|---|---|---|---|---|---|"]
+    for r in bands:
+        lo, hi = r["range"]
+        L.append(f"| {r['total']} | {r['profile']} | {r['max3h']:.1f} | {r['severity']:.2f} | {r['low']:.1%} | "
+                 f"{r['medium']:.1%} | {r['high']:.1%} | {lo:.0%}-{hi:.0%} | {'PASS' if r['ok'] else 'FAIL'} |")
+    L += ["", f"- Light rain (< {config.LIGHT_RAIN_MM} mm) flags no medium or high cells: **{'PASS' if props['light_rain_clean'] else 'FAIL'}**",
+          f"- Every cell's risk is non-decreasing as rainfall rises (0-400 mm): **{'PASS' if props['monotone'] else 'FAIL'}**",
+          f"- Cell order by risk never changes with rainfall (rank-preserving): **{'PASS' if props['rank_preserving'] else 'FAIL'}**", ""]
 
-    r = meta["rain"]
-    L += ["## E. Rainfall conditioning parameters", "",
-          f"- k = {r['k']:.4f} per mm: {r['k_source']}",
-          f"- r0 = {r['r0']:.1f} mm: {r['r0_source']}",
-          f"- {r['note']}" if r["note"] else "- (no notes)",
-          "- Rain bands (IMD-style, 24 h): " + ", ".join(f"{n} >= {v} mm" for n, v in config.RAIN_BANDS_24H)
-          + " - **verify** against IMD before quoting.",
+    L += ["## E. Stage 2: budgeted ranking (policy targets, not fitted)", "",
+          "Rain severity (0-1) = max(severity of the 24 h total, severity of the wettest 3 h), averaged over the whole study "
+          "grid. It sets the share of cells that are high / medium; the stage-1 susceptibility percentile (over the full grid, "
+          "so a street keeps its rank in any viewport) decides which. risk_score is continuous: low [0, 0.33), medium "
+          "[0.33, 0.66), high [0.66, 1], rising with susceptibility inside each band.", "",
+          "| 24 h rain (mm) | severity | high budget | medium+high budget |", "|---|---|---|---|"]
+    for mm, sev, fh, fm in budget.budget_table():
+        L.append(f"| {mm:g} | {sev:.2f} | {fh:.1%} | {fm:.1%} |")
+    L += ["",
+          "- 24 h severity knots (IMD-style lower bounds, **verify**): " + ", ".join(f"{m:g} mm -> {v:.2f}" for m, v in config.SEVERITY_24H_KNOTS),
+          "- Wettest-3 h severity knots (heuristic, not IMD, **verify**): " + ", ".join(f"{m:g} mm -> {v:.2f}" for m, v in config.SEVERITY_3H_KNOTS),
+          f"- Caps: high <= {config.HIGH_CAP:.0%}, medium+high <= {config.MED_CAP:.0%} of study-area cells.",
           "- Event windows (start inclusive, end exclusive): " + ", ".join(f"{e}: {s.isoformat()} to {en.isoformat()}" for e, (s, en) in events.items())
           + f" (source: {win_src}).",
-          "- Within a single event, forecast rain is nearly uniform over the city, so cell ranking inside an event is "
-          "set by susceptibility; rainfall decides how many cells reach amber/red.", ""]
+          "- Nothing in this stage was tuned on synthetic data, and none of it is fitted to real data either.", ""]
 
     L += ["## Plots", "", f"![Precision-recall]({plot_rel[0]})", "", f"![Recall at top-k]({plot_rel[1]})", ""]
     L += ["## Limitations", "",
@@ -399,7 +404,11 @@ def render_markdown(meta, n_folds, cv_results, holdout_rows, replay_rows, bands,
           "- **Only reported hotspots:** labels come from documented/news waterlogging sites, biased toward busy roads and "
           "well-reported areas.",
           "- **Coarse rainfall:** Open-Meteo points are kilometres apart; street-level rain variation is invisible.",
-          "- **Few events:** at most two events, so rain sensitivity is weakly identified and defaults are heuristic.",
+          "- **Few events:** at most two events, so rain sensitivity cannot be fitted; stage 2 uses policy targets.",
+          "- **Budgets are policy, not measurement:** the share of cells flagged at each rainfall level is a design choice "
+          "(see `config.py`), so a high band does not mean a measured probability of flooding.",
+          "- **Study-area rainfall:** severity uses the mean forecast over the whole grid; a storm that hits only part of the "
+          "city is under-weighted.",
           "- **Reanalysis historical rainfall (~10 km) tends to understate extreme local rain; training and live "
           "forecast rainfall come from different sources.**",
           "- **Ranking, not depth:** scores order cells by relative hotspot risk. They are not water depths, "
@@ -427,11 +436,10 @@ def main(argv=None):
     events = sorted(hotspots.event.unique())
     holdout_rows, curves = event_holdout(table, hotspots, events) if len(events) >= 2 else ([], {})
     st = predmod.get_state(d)
-    bands = band_distribution(st.u, st.k, st.r0)
-    proposal = band_proposal(st.u, st.k, st.r0)
-    mono = monotone_ok(st.u, st.k, st.r0)
+    bands = budget_check(st.u)
+    props = property_checks(st.u)
     windows, win_src = event_windows(d)
-    replay_rows = (event_replay(table, hotspots, events, windows, rainmod.load_rainfall(d), st.k, st.r0)
+    replay_rows = (event_replay(table, hotspots, events, windows, rainmod.load_rainfall(d))
                    if len(events) >= 2 else [])
     plot_dir = Path(args.plot_dir) if args.plot_dir else config.artifact_root() / "plots"
     pr_path, rk_path = make_plots(src, y_true, cv_scores, curves, plot_dir)
@@ -440,13 +448,12 @@ def main(argv=None):
         rel = [Path(p).resolve().relative_to(out.resolve().parent).as_posix() for p in (pr_path, rk_path)]
     except ValueError:
         rel = [str(pr_path), str(rk_path)]
-    out.write_text(render_markdown(meta, n_folds, cv_results, holdout_rows, replay_rows, bands, proposal, mono,
+    out.write_text(render_markdown(meta, n_folds, cv_results, holdout_rows, replay_rows, bands, props,
                                    windows, win_src, rel), encoding="utf-8")
     m = cv_results["XGBoost (ours)"]
     print(f"spatial CV: PR-AUC {m['pr_auc']:.3f}, recall@10% {m['recall@10%']:.1%}, lift@10% {m['lift@10%']:.2f}x")
-    if proposal:
-        print(f"PROPOSAL (not applied): {proposal['worst_high_share']:.0%} of cells are high at "
-              f"{config.BAND_CHECK_AT_MM} mm; see BACKTEST.md section D")
+    fails = [r for r in bands if not r["ok"]]
+    print(f"budget check: {len(bands) - len(fails)}/{len(bands)} rows inside the policy ranges; properties {props}")
     print(f"wrote {out} and plots in {plot_dir}")
     return 0
 
